@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::Command;
 
 mod other;
-pub use other::{AgentCli, Provider};
+pub use other::{AgentCli, Provider, ProviderError};
 
 const STDERR_LIMIT: usize = 4096;
 

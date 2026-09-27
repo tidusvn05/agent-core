@@ -10,6 +10,33 @@ use tokio::process::Command;
 
 use crate::{Error, OpenCodeV2, RunRequest, RunResult, TokenUsage};
 
+/// An adapter error with the selected provider preserved for callers.
+#[derive(Debug, thiserror::Error)]
+#[error("{provider:?} CLI: {source}")]
+pub struct ProviderError {
+    pub provider: Provider,
+    #[source]
+    pub source: Error,
+}
+
+impl ProviderError {
+    /// Process exit code, when the CLI exited unsuccessfully.
+    pub fn exit_code(&self) -> Option<i32> {
+        match &self.source {
+            Error::Exit { status, .. } => *status,
+            _ => None,
+        }
+    }
+
+    /// Captured stderr from a failed CLI process, when available.
+    pub fn stderr_tail(&self) -> Option<&str> {
+        match &self.source {
+            Error::Exit { stderr_tail, .. } => Some(stderr_tail),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     Claude,
@@ -37,6 +64,19 @@ pub struct AgentCli {
 }
 
 impl AgentCli {
+    /// Discover a CLI while preserving its provider in any error.
+    pub fn discover_with_context(provider: Provider) -> Result<Self, ProviderError> {
+        Self::discover(provider).map_err(|source| ProviderError { provider, source })
+    }
+
+    /// Use an explicit CLI path while preserving its provider in any error.
+    pub fn with_binary_with_context(
+        provider: Provider,
+        binary: impl Into<PathBuf>,
+    ) -> Result<Self, ProviderError> {
+        Self::with_binary(provider, binary).map_err(|source| ProviderError { provider, source })
+    }
+
     pub fn discover(provider: Provider) -> Result<Self, Error> {
         Self::with_binary(provider, provider.executable())
     }
@@ -66,6 +106,14 @@ impl AgentCli {
 
     pub fn provider(&self) -> Provider {
         self.provider
+    }
+
+    /// Run a request while preserving provider, exit code, and stderr in errors.
+    pub async fn run_with_context(&self, request: RunRequest) -> Result<RunResult, ProviderError> {
+        self.run(request).await.map_err(|source| ProviderError {
+            provider: self.provider,
+            source,
+        })
     }
 
     pub async fn run(&self, request: RunRequest) -> Result<RunResult, Error> {

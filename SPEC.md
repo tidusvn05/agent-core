@@ -1,4 +1,4 @@
-# agent-core 0.2 specification
+# agent-core 0.3 specification
 
 `agent-core` is a Rust library for one-shot calls to four installed agent CLIs.
 It does not start or manage a persistent chat session. Authentication is owned
@@ -30,4 +30,6 @@ the adapter does not pass `--auto`. Claude, Codex, and Devin retain the
 permission settings from their earlier agentwiki adapters.
 
 The public API is `Provider`, `AgentCli`, `RunRequest`, `RunResult`,
-`TokenUsage`, and `Error`. `OpenCodeV2` remains available for direct v2 calls.
+`TokenUsage`, `Error`, and `ProviderError`. `AgentCli` also has context-preserving
+discovery and run methods that attach the selected provider to the original
+error. `OpenCodeV2` remains available for direct v2 calls.

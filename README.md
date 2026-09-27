@@ -16,7 +16,7 @@ application needs to remove environment variables before spawning the CLI.
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/tidusvn05/agent-core", tag = "v0.2.0" }
+agent-core = { git = "https://github.com/tidusvn05/agent-core", tag = "v0.3.0" }
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
@@ -78,6 +78,30 @@ cargo run --example run -- opencode openai/gpt-5#high
 ```
 
 Choose model IDs available in your authenticated CLI configuration.
+
+## Structured errors
+
+Use `discover_with_context`, `with_binary_with_context`, and
+`run_with_context` when the caller needs the selected provider alongside a
+failure. `ProviderError` exposes `provider` and the original `source: Error`;
+`exit_code()` and `stderr_tail()` read the fields of an `Error::Exit` without
+parsing its display text. The original methods remain available.
+
+## Real CLI smoke tests
+
+The opt-in smoke tests make one short request per provider. Set the model to
+one supported by your authenticated CLI, then run a single test:
+
+```sh
+AGENT_CORE_CODEX_MODEL='gpt-5.6-sol@high' \
+  cargo test --test real_cli_smoke codex -- --ignored
+```
+
+Replace `CODEX` and `codex` with `CLAUDE`/`claude`, `DEVIN`/`devin`, or
+`OPENCODE`/`opencode`. These calls use real quota and have a 180-second timeout.
+Claude and Codex receive a native JSON Schema; Devin and OpenCode output is
+checked as JSON by the test because their adapters do not enforce schemas.
+The regular `cargo test` suite uses fake CLIs and does not make real calls.
 
 Claude and Codex accept an optional `json_schema` and enforce it through their
 native CLI flags. Devin and OpenCode return text for the caller to validate.

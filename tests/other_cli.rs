@@ -173,3 +173,46 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
     }));
     assert_eq!(cli.run(req).await.unwrap().text, "ok");
 }
+
+#[tokio::test]
+async fn contextual_error_preserves_provider_exit_code_and_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = fake_cli(dir.path(), "devin-error", "echo 'bad model' >&2\nexit 17");
+    let cli = AgentCli::with_binary(Provider::Devin, binary).unwrap();
+    let error = cli.run_with_context(request(dir.path())).await.unwrap_err();
+    assert_eq!(error.provider, Provider::Devin);
+    assert_eq!(error.exit_code(), Some(17));
+    assert_eq!(error.stderr_tail(), Some("bad model\n"));
+    assert!(matches!(
+        error.source,
+        Error::Exit {
+            status: Some(17),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn contextual_discovery_error_preserves_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-codex");
+    let error = AgentCli::with_binary_with_context(Provider::Codex, missing).unwrap_err();
+    assert_eq!(error.provider, Provider::Codex);
+    assert!(matches!(error.source, Error::NotFound(_)));
+}
+
+#[tokio::test]
+async fn other_adapters_enforce_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    for provider in [Provider::Claude, Provider::Codex, Provider::Devin] {
+        let binary = fake_cli(dir.path(), provider.executable(), "exec sleep 5");
+        let cli = AgentCli::with_binary(provider, binary).unwrap();
+        let mut req = request(dir.path());
+        req.timeout = Duration::from_millis(50);
+        let error = cli.run_with_context(req).await.unwrap_err();
+        assert_eq!(error.provider, provider);
+        assert!(matches!(error.source, Error::Timeout(_)));
+        assert_eq!(error.exit_code(), None);
+        assert_eq!(error.stderr_tail(), None);
+    }
+}
