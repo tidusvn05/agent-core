@@ -1,8 +1,8 @@
 //! One-shot Rust adapters for Claude, Codex, Devin, and OpenCode v2 CLIs.
 //!
-//! Each call runs `opencode run --standalone --format json` and returns the
-//! completed assistant text. Authentication and model defaults come from the
-//! installed OpenCode CLI unless the caller chooses a model explicitly.
+//! Each call runs a fresh CLI process and returns the completed assistant text.
+//! Authentication and model defaults come from the installed CLI unless the
+//! caller chooses a model explicitly.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,12 +19,12 @@ pub use other::{AgentCli, Provider};
 
 const STDERR_LIMIT: usize = 4096;
 
-/// A single, fresh OpenCode run.
+/// A single, fresh CLI run.
 #[derive(Debug, Clone)]
 pub struct RunRequest {
     pub prompt: String,
     pub cwd: PathBuf,
-    /// OpenCode model ID, for example `openai/gpt-5#high`.
+    /// Model ID for the chosen provider, or `None` for its configured default.
     pub model: Option<String>,
     pub timeout: Duration,
     /// Environment variable names to remove from the child only.
@@ -34,7 +34,7 @@ pub struct RunRequest {
     pub json_schema: Option<Value>,
 }
 
-/// Token accounting reported by completed OpenCode steps.
+/// Token accounting reported by the CLI.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input: u64,
@@ -44,7 +44,7 @@ pub struct TokenUsage {
     pub cache_write: u64,
 }
 
-/// Result of one OpenCode run.
+/// Result of one CLI run.
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub text: String,
@@ -57,17 +57,17 @@ pub struct RunResult {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("OpenCode executable not found: {0}")]
+    #[error("CLI executable not found: {0}")]
     NotFound(PathBuf),
-    #[error("failed to probe OpenCode version: {0}")]
+    #[error("failed to probe CLI version: {0}")]
     VersionProbe(String),
     #[error("OpenCode v2 required, found: {0}")]
     UnsupportedVersion(String),
     #[error("invalid run request: {0}")]
     InvalidRequest(String),
-    #[error("failed to run OpenCode: {0}")]
+    #[error("failed to run CLI: {0}")]
     Io(#[from] std::io::Error),
-    #[error("OpenCode timed out after {0:?}")]
+    #[error("CLI timed out after {0:?}")]
     Timeout(Duration),
     #[error("CLI exited with {status:?}: {stderr_tail}")]
     Exit {
@@ -76,7 +76,7 @@ pub enum Error {
     },
     #[error("agent reported an error: {0}")]
     Agent(String),
-    #[error("invalid OpenCode JSONL: {0}")]
+    #[error("invalid CLI output: {0}")]
     Protocol(String),
     #[error("agent returned no assistant text")]
     EmptyResponse,
