@@ -1,0 +1,507 @@
+//! Native one-shot adapters for the Claude, Codex, and Devin CLIs.
+
+use std::path::PathBuf;
+use std::process::{Output, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
+
+use crate::{Error, OpenCodeV2, RunRequest, RunResult, TokenUsage};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provider {
+    Claude,
+    Codex,
+    Devin,
+    OpenCodeV2,
+}
+
+impl Provider {
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Devin => "devin",
+            Self::OpenCodeV2 => "opencode",
+        }
+    }
+}
+
+/// A local CLI adapter. Each `run` starts a fresh process and returns one result.
+#[derive(Debug, Clone)]
+pub struct AgentCli {
+    provider: Provider,
+    binary: PathBuf,
+}
+
+impl AgentCli {
+    pub fn discover(provider: Provider) -> Result<Self, Error> {
+        Self::with_binary(provider, provider.executable())
+    }
+
+    pub fn with_binary(provider: Provider, binary: impl Into<PathBuf>) -> Result<Self, Error> {
+        let binary = binary.into();
+        if provider == Provider::OpenCodeV2 {
+            OpenCodeV2::with_binary(binary.clone())?;
+        } else {
+            let output = std::process::Command::new(&binary)
+                .arg("--version")
+                .output()
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => Error::NotFound(binary.clone()),
+                    _ => Error::VersionProbe(e.to_string()),
+                })?;
+            if !output.status.success() {
+                return Err(Error::VersionProbe(format!(
+                    "{} --version exited {:?}",
+                    provider.executable(),
+                    output.status.code()
+                )));
+            }
+        }
+        Ok(Self { provider, binary })
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub async fn run(&self, request: RunRequest) -> Result<RunResult, Error> {
+        validate_request(&request)?;
+        match self.provider {
+            Provider::OpenCodeV2 => {
+                OpenCodeV2 {
+                    binary: self.binary.clone(),
+                }
+                .run(request)
+                .await
+            }
+            Provider::Claude => self.run_claude(request).await,
+            Provider::Codex => self.run_codex(request).await,
+            Provider::Devin => self.run_devin(request).await,
+        }
+    }
+
+    async fn run_claude(&self, request: RunRequest) -> Result<RunResult, Error> {
+        let mut command = Command::new(&self.binary);
+        command.args([
+            "-p",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--permission-mode",
+            "bypassPermissions",
+            "--setting-sources",
+            "local",
+        ]);
+        if let Some(model) = request.model.as_deref() {
+            let (name, effort) = split_effort(model, &["low", "medium", "high", "xhigh", "max"])?;
+            command.arg("--model").arg(name);
+            if let Some(effort) = effort {
+                command.arg("--effort").arg(effort);
+            }
+        }
+        if let Some(mut schema) = request.json_schema.clone() {
+            strip_schema_uri(&mut schema);
+            command.arg("--json-schema").arg(schema.to_string());
+        }
+        configure(&mut command, &request, true);
+        let (output, duration) = capture(command, Some(&request.prompt), request.timeout).await?;
+        let stderr_tail = stderr_tail(&output.stderr);
+        let envelope: Value = match serde_json::from_slice(&output.stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                check_status(&output, &stderr_tail)?;
+                return Err(Error::Protocol(format!("Claude JSON envelope: {error}")));
+            }
+        };
+        let error = if envelope["is_error"].as_bool() == Some(true) {
+            let details = envelope["errors"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|s| !s.is_empty());
+            Some(
+                details
+                    .or_else(|| envelope["result"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown Claude error".into()),
+            )
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(Error::Agent(error));
+        }
+        check_status(&output, &stderr_tail)?;
+        let text = envelope
+            .get("structured_output")
+            .filter(|v| !v.is_null())
+            .map(Value::to_string)
+            .or_else(|| envelope["result"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        let usage = envelope
+            .get("usage")
+            .filter(|v| v.is_object())
+            .map(|u| TokenUsage {
+                input: u["input_tokens"].as_u64().unwrap_or(0),
+                output: u["output_tokens"].as_u64().unwrap_or(0),
+                cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                ..Default::default()
+            });
+        result(
+            text,
+            envelope["session_id"].as_str(),
+            usage,
+            duration,
+            stderr_tail,
+        )
+    }
+
+    async fn run_codex(&self, request: RunRequest) -> Result<RunResult, Error> {
+        let out_file = tempfile::NamedTempFile::new()?;
+        let schema_file = if let Some(mut schema) = request.json_schema.clone() {
+            normalize_codex_schema(&mut schema);
+            let file = tempfile::NamedTempFile::new()?;
+            std::fs::write(file.path(), schema.to_string())?;
+            Some(file)
+        } else {
+            None
+        };
+        let mut command = Command::new(&self.binary);
+        command
+            .args([
+                "exec",
+                "--skip-git-repo-check",
+                "-s",
+                "read-only",
+                "--color",
+                "never",
+                "--ephemeral",
+                "--disable",
+                "hooks",
+                "-c",
+                "project_doc_max_bytes=0",
+                "--json",
+                "-o",
+            ])
+            .arg(out_file.path());
+        if let Some(model) = request.model.as_deref() {
+            let (name, effort) =
+                split_effort(model, &["low", "medium", "high", "xhigh", "max", "ultra"])?;
+            command.arg("-m").arg(name);
+            if let Some(effort) = effort {
+                command
+                    .arg("-c")
+                    .arg(format!("model_reasoning_effort=\"{effort}\""));
+            }
+        }
+        if let Some(file) = &schema_file {
+            command.arg("--output-schema").arg(file.path());
+        }
+        command.arg("-");
+        configure(&mut command, &request, true);
+        let (output, duration) = capture(command, Some(&request.prompt), request.timeout).await?;
+        let stderr_tail = stderr_tail(&output.stderr);
+        check_status(&output, &stderr_tail)?;
+        let mut text = None;
+        let mut session_id = None;
+        let mut usage = None;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let event: Value = serde_json::from_str(line)
+                .map_err(|e| Error::Protocol(format!("Codex JSONL: {e}")))?;
+            match event["type"].as_str() {
+                Some("thread.started") => {
+                    session_id = event["thread_id"].as_str().map(str::to_string)
+                }
+                Some("item.completed") if event["item"]["type"] == "agent_message" => {
+                    text = event["item"]["text"].as_str().map(str::to_string);
+                }
+                Some("turn.completed") => {
+                    let u = &event["usage"];
+                    usage = Some(TokenUsage {
+                        input: u["input_tokens"].as_u64().unwrap_or(0),
+                        output: u["output_tokens"].as_u64().unwrap_or(0),
+                        reasoning: u["reasoning_output_tokens"].as_u64().unwrap_or(0),
+                        ..Default::default()
+                    });
+                }
+                Some("turn.failed" | "error") => {
+                    return Err(Error::Agent(
+                        event["error"]["message"]
+                            .as_str()
+                            .or_else(|| event["message"].as_str())
+                            .unwrap_or("unknown Codex error")
+                            .to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let from_file = std::fs::read_to_string(out_file.path())?;
+        result(
+            if from_file.trim().is_empty() {
+                text.unwrap_or_default()
+            } else {
+                from_file
+            },
+            session_id.as_deref(),
+            usage,
+            duration,
+            stderr_tail,
+        )
+    }
+
+    async fn run_devin(&self, request: RunRequest) -> Result<RunResult, Error> {
+        let prompt_file = tempfile::NamedTempFile::new()?;
+        std::fs::write(prompt_file.path(), &request.prompt)?;
+        let mut command = Command::new(&self.binary);
+        command
+            .arg("-p")
+            .arg("--prompt-file")
+            .arg(prompt_file.path())
+            .args([
+                "--respect-workspace-trust",
+                "false",
+                "--permission-mode",
+                "auto",
+            ]);
+        if let Some(model) = &request.model {
+            command.arg("--model").arg(model);
+        }
+        configure(&mut command, &request, false);
+        let (output, duration) = capture(command, None, request.timeout).await?;
+        let stderr_tail = stderr_tail(&output.stderr);
+        check_status(&output, &stderr_tail)?;
+        result(
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            None,
+            None,
+            duration,
+            stderr_tail,
+        )
+    }
+}
+
+fn validate_request(request: &RunRequest) -> Result<(), Error> {
+    if request.prompt.trim().is_empty() {
+        return Err(Error::InvalidRequest("prompt is empty".into()));
+    }
+    if !request.cwd.is_dir() {
+        return Err(Error::InvalidRequest(format!(
+            "working directory does not exist: {}",
+            request.cwd.display()
+        )));
+    }
+    Ok(())
+}
+
+fn split_effort<'a>(model: &'a str, valid: &[&str]) -> Result<(&'a str, Option<&'a str>), Error> {
+    if model.trim().is_empty() {
+        return Err(Error::InvalidRequest("model is empty".into()));
+    }
+    if let Some((name, effort)) = model.rsplit_once('@') {
+        if name.is_empty() || !valid.contains(&effort) {
+            return Err(Error::InvalidRequest(format!(
+                "unsupported model effort: {model}"
+            )));
+        }
+        Ok((name, Some(effort)))
+    } else {
+        Ok((model, None))
+    }
+}
+
+fn configure(command: &mut Command, request: &RunRequest, stdin: bool) {
+    command
+        .current_dir(&request.cwd)
+        .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for name in &request.env_remove {
+        command.env_remove(name);
+    }
+}
+
+async fn capture(
+    mut command: Command,
+    prompt: Option<&str>,
+    timeout: Duration,
+) -> Result<(Output, Duration), Error> {
+    let started = Instant::now();
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let work = async {
+        let write = async {
+            if let (Some(prompt), Some(mut stdin)) = (prompt, stdin.take()) {
+                stdin.write_all(prompt.as_bytes()).await?;
+                stdin.shutdown().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let read_out = async {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let read_err = async {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let (written, out, err, status) = tokio::join!(write, read_out, read_err, child.wait());
+        let output = Output {
+            status: status?,
+            stdout: out?,
+            stderr: err?,
+        };
+        if let Err(error) = written
+            && output.status.success()
+        {
+            return Err(Error::Io(error));
+        }
+        Ok((output, started.elapsed()))
+    };
+    match tokio::time::timeout(timeout, work).await {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(Error::Timeout(timeout))
+        }
+    }
+}
+
+fn check_status(output: &Output, stderr_tail: &str) -> Result<(), Error> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Exit {
+            status: output.status.code(),
+            stderr_tail: stderr_tail.into(),
+        })
+    }
+}
+
+fn result(
+    text: String,
+    session_id: Option<&str>,
+    usage: Option<TokenUsage>,
+    duration: Duration,
+    stderr_tail: String,
+) -> Result<RunResult, Error> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(Error::EmptyResponse);
+    }
+    Ok(RunResult {
+        text,
+        session_id: session_id.map(str::to_string),
+        usage,
+        duration,
+        stderr_tail,
+    })
+}
+
+fn stderr_tail(bytes: &[u8]) -> String {
+    let bytes = &bytes[bytes.len().saturating_sub(4096)..];
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+fn strip_schema_uri(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            for item in map.values_mut() {
+                strip_schema_uri(item);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_schema_uri(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_codex_schema(value: &mut Value) {
+    let map = match value {
+        Value::Object(map) => map,
+        Value::Array(items) => {
+            for item in items {
+                normalize_codex_schema(item);
+            }
+            return;
+        }
+        _ => return,
+    };
+    map.remove("$schema");
+    if map.contains_key("$ref") && map.len() > 1 {
+        let reference = map.remove("$ref").expect("reference exists");
+        map.clear();
+        map.insert("$ref".into(), reference);
+    }
+    if let Some(Value::Array(variants)) = map.remove("oneOf") {
+        let constants: Option<Vec<Value>> =
+            variants.iter().map(|v| v.get("const").cloned()).collect();
+        if let Some(constants) = constants {
+            let mut types: Vec<&str> = variants
+                .iter()
+                .filter_map(|v| v.get("type").and_then(Value::as_str))
+                .collect();
+            types.sort_unstable();
+            types.dedup();
+            if let [ty] = types.as_slice() {
+                map.insert("type".into(), Value::String((*ty).into()));
+            }
+            map.insert("enum".into(), Value::Array(constants));
+        } else {
+            map.insert("anyOf".into(), Value::Array(variants));
+        }
+    }
+    for child in map.values_mut() {
+        normalize_codex_schema(child);
+    }
+    if map.get("type").and_then(Value::as_str) == Some("object") || map.contains_key("properties") {
+        let required: std::collections::HashSet<String> = map
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if let Some(Value::Object(properties)) = map.get_mut("properties") {
+            let all = properties.keys().cloned().map(Value::String).collect();
+            for (name, spec) in properties.iter_mut() {
+                if !required.contains(name) && !nullable(spec) {
+                    let previous = spec.take();
+                    *spec = serde_json::json!({"anyOf":[previous,{"type":"null"}]});
+                }
+            }
+            map.insert("required".into(), Value::Array(all));
+        }
+        map.insert("additionalProperties".into(), Value::Bool(false));
+    }
+}
+
+fn nullable(value: &Value) -> bool {
+    value["type"] == "null"
+        || value["type"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v == "null"))
+        || value["anyOf"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v["type"] == "null"))
+}

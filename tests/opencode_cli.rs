@@ -31,6 +31,7 @@ fn request(dir: &Path) -> RunRequest {
         model: Some("openai/model#high".into()),
         timeout: Duration::from_secs(2),
         env_remove: vec!["TEST_API_KEY".into()],
+        json_schema: None,
     }
 }
 

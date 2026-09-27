@@ -1,0 +1,33 @@
+# agent-core 0.2 specification
+
+`agent-core` is a Rust library for one-shot calls to four installed agent CLIs.
+It does not start or manage a persistent chat session. Authentication is owned
+by each CLI. A caller supplies a prompt, working directory, optional model,
+timeout, optional JSON Schema, and names of child environment variables to
+remove. Every invocation starts a fresh process and returns final text,
+optional session ID and token usage, elapsed time, and the stderr tail.
+
+| Provider | Native command | Prompt | Model format | Output | JSON Schema |
+|---|---|---|---|---|---|
+| Claude | `claude -p --output-format json` | stdin | `sonnet@high` or CLI default | JSON envelope | `--json-schema` |
+| Codex | `codex exec --json -o <file> -` | stdin | `gpt-5.6-sol@high` or CLI default | JSONL + final-message file | `--output-schema <file>` |
+| Devin | `devin -p --prompt-file <file>` | temporary file | CLI model ID or default | stdout | unsupported |
+| OpenCode v2 | `opencode run --standalone --format json` | stdin | `provider/model#variant` or CLI default | JSONL | unsupported |
+
+Only OpenCode major version 2 is accepted. `AgentCli::discover` and
+`AgentCli::with_binary` check `opencode --version` before a run. The other
+adapters do not impose a major-version constraint.
+
+Claude and Codex return structured output errors even if their process exits
+successfully. Codex uses the final-message file when present and the last
+`agent_message` event otherwise. OpenCode token usage is absent when its
+stream does not report a completed final step. Devin currently exposes no
+token usage through this interface.
+
+Timeout and future cancellation terminate the child process. The library
+never retries automatically. OpenCode uses its headless permission defaults;
+the adapter does not pass `--auto`. Claude, Codex, and Devin retain the
+permission settings from their earlier agentwiki adapters.
+
+The public API is `Provider`, `AgentCli`, `RunRequest`, `RunResult`,
+`TokenUsage`, and `Error`. `OpenCodeV2` remains available for direct v2 calls.

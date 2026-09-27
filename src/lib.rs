@@ -1,4 +1,4 @@
-//! One-shot Rust adapter for the OpenCode v2 CLI.
+//! One-shot Rust adapters for Claude, Codex, Devin, and OpenCode v2 CLIs.
 //!
 //! Each call runs `opencode run --standalone --format json` and returns the
 //! completed assistant text. Authentication and model defaults come from the
@@ -14,6 +14,9 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+mod other;
+pub use other::{AgentCli, Provider};
+
 const STDERR_LIMIT: usize = 4096;
 
 /// A single, fresh OpenCode run.
@@ -26,6 +29,9 @@ pub struct RunRequest {
     pub timeout: Duration,
     /// Environment variable names to remove from the child only.
     pub env_remove: Vec<OsString>,
+    /// Optional JSON Schema. Claude and Codex enforce it; Devin and OpenCode
+    /// leave validation to the caller.
+    pub json_schema: Option<Value>,
 }
 
 /// Token accounting reported by completed OpenCode steps.
@@ -63,16 +69,16 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("OpenCode timed out after {0:?}")]
     Timeout(Duration),
-    #[error("OpenCode exited with {status:?}: {stderr_tail}")]
+    #[error("CLI exited with {status:?}: {stderr_tail}")]
     Exit {
         status: Option<i32>,
         stderr_tail: String,
     },
-    #[error("OpenCode reported an error: {0}")]
+    #[error("agent reported an error: {0}")]
     Agent(String),
     #[error("invalid OpenCode JSONL: {0}")]
     Protocol(String),
-    #[error("OpenCode returned no assistant text")]
+    #[error("agent returned no assistant text")]
     EmptyResponse,
 }
 
