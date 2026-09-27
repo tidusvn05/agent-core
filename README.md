@@ -16,7 +16,7 @@ application needs to remove environment variables before spawning the CLI.
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/tidusvn05/agent-core", tag = "v0.3.0" }
+agent-core = { git = "https://github.com/tidusvn05/agent-core", tag = "v0.3.1" }
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
