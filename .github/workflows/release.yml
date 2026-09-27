@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release automation
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: automation
+          persist-credentials: false
+
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag and crate version
+        working-directory: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Expected a vMAJOR.MINOR.PATCH tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+          tagged_commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          test "$(git rev-parse HEAD)" = "$tagged_commit"
+          crate_version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "agent-core") | .version')
+          test "$RELEASE_TAG" = "v$crate_version" || {
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          }
+
+      - name: Test and package
+        working-directory: source
+        run: |
+          cargo test --locked
+          cargo package --locked
+
+      - name: Generate changelog
+        working-directory: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: bash ../automation/scripts/release_notes.sh "$RELEASE_TAG" ../automation/CHANGELOG.md
+
+      - name: Publish GitHub Release
+        working-directory: automation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" CHANGELOG.md \
+            --verify-tag \
+            --title "agent-core $RELEASE_TAG" \
+            --notes-file CHANGELOG.md

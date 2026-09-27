@@ -103,6 +103,23 @@ Claude and Codex receive a native JSON Schema; Devin and OpenCode output is
 checked as JSON by the test because their adapters do not enforce schemas.
 The regular `cargo test` suite uses fake CLIs and does not make real calls.
 
+## Releases
+
+Release tags use `vMAJOR.MINOR.PATCH` and must match the version in
+`Cargo.toml`. After updating `Cargo.toml`, `Cargo.lock`, and the README's
+dependency example, push the commit and its tag:
+
+```sh
+git tag -a v0.4.0 -m 'agent-core v0.4.0'
+git push origin main v0.4.0
+```
+
+The [release workflow](.github/workflows/release.yml) tests and packages the
+tagged crate, then creates a GitHub Release. Its body and attached
+`CHANGELOG.md` list every commit since the previous version tag, including
+commits made outside pull requests. To publish an existing tag, run the Release
+workflow manually and enter the tag. Publishing the same tag again is safe.
+
 Claude and Codex accept an optional `json_schema` and enforce it through their
 native CLI flags. Devin and OpenCode return text for the caller to validate.
 `RunResult::usage` is `None` when usage is unavailable or incomplete. For the
