@@ -23,14 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out release automation
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
           path: automation
           persist-credentials: false
 
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref_name }}
           path: source
